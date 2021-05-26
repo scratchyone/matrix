@@ -48,6 +48,7 @@ impl Screen {
         ret
     }
     pub fn flush(&mut self) -> Result<u32> {
+        let mut stdout = self.stdout.lock();
         let mut writes = 0;
         let (columns, rows) = terminal::size()?;
         if self.last_known_size != (columns, rows) || !self.already_flushed {
@@ -55,7 +56,7 @@ impl Screen {
                 for x in 0..columns {
                     if let Some(item) = self.buffer.get(&(x, y)) {
                         queue!(
-                            self.stdout,
+                            stdout,
                             SetForegroundColor(item.fg_color),
                             SetBackgroundColor(item.bg_color),
                             MoveTo(x, y),
@@ -64,7 +65,7 @@ impl Screen {
                         )?;
                         writes += 1;
                     } else {
-                        queue!(self.stdout, ResetColor, MoveTo(x, y), Print(" "))?;
+                        queue!(stdout, ResetColor, MoveTo(x, y), Print(" "))?;
                     }
                 }
             }
@@ -80,7 +81,7 @@ impl Screen {
                     }
                 {
                     queue!(
-                        self.stdout,
+                        stdout,
                         SetForegroundColor(item.fg_color),
                         SetBackgroundColor(item.bg_color),
                         MoveTo(*x, *y),
@@ -93,17 +94,16 @@ impl Screen {
 
             for ((x, y), item) in &self.terminal {
                 if !self.buffer.contains_key(&(*x, *y)) && x < &columns && y < &rows {
-                    queue!(self.stdout, ResetColor, MoveTo(*x, *y), Print(" "))?;
+                    queue!(stdout, ResetColor, MoveTo(*x, *y), Print(" "))?;
                     writes += 1;
                 }
             }
         }
         self.terminal = self.buffer.clone();
         self.last_known_size = (columns, rows);
-        queue!(self.stdout, MoveTo(0, rows)).unwrap();
         self.buffer = HashMap::new();
         self.already_flushed = true;
-        self.stdout.flush()?;
+        stdout.flush()?;
         Ok(writes)
     }
     pub fn set(&mut self, x: u16, y: u16, item: ScreenItem) {
@@ -167,21 +167,23 @@ fn main() -> Result<()> {
 
     loop {
         let frame_time_ns = last_frame.elapsed().as_nanos();
+        let frame_time_ms = last_frame.elapsed().as_millis();
+
         last_frame = Instant::now();
         let (columns, rows) = terminal::size()?;
         screen.clear(bg_color)?;
         for mut line in &mut lines {
+            let grad = Gradient::new(vec![
+                Hsv::new(141.0, 1.0, 0.43),
+                //Hsv::new(141.0, 1.0, 0.43),
+                Hsv::new(141.0, 0.97, 0.05),
+            ])
+            .take(line.length as usize)
+            .map(|n| LinSrgb::from(n))
+            .collect::<Vec<_>>();
             for item in 0..(line.length) {
-                let grad = Gradient::new(vec![
-                    Hsv::new(141.0, 1.0, 0.43),
-                    //Hsv::new(141.0, 1.0, 0.43),
-                    Hsv::new(141.0, 0.97, 0.05),
-                ])
-                .take(line.length as usize)
-                .map(|n| LinSrgb::from(n))
-                .collect::<Vec<_>>();
-                let y = (line.y - item as f64).round() - 1.0;
-                if y >= 0.0 && y <= rows as f64 - 1.0 {
+                let y = (line.y - item as f64).round() as u16 - 1;
+                if y <= rows {
                     screen.set(
                         line.x,
                         y as u16,
@@ -190,9 +192,9 @@ fn main() -> Result<()> {
                             fg_color: match item {
                                 0 => Color::White,
                                 _ => Color::Rgb {
-                                    r: (grad[item as usize].red as f32 * 255.0).round() as u8,
-                                    g: (grad[item as usize].green as f32 * 255.0).round() as u8,
-                                    b: (grad[item as usize].blue as f32 * 255.0).round() as u8,
+                                    r: (grad[item as usize].red * 255.0f32).round() as u8,
+                                    g: (grad[item as usize].green * 255.0f32).round() as u8,
+                                    b: (grad[item as usize].blue * 255.0f32).round() as u8,
                                 },
                             },
                             text: if line.items.len() <= y as usize {
@@ -214,7 +216,7 @@ fn main() -> Result<()> {
                 fg_color: Color::Blue,
                 bg_color,
                 text: format!(
-                    "{} fps\n{} lines\nFrametime: {}ns\n{} screen writes per frame\nterminal is {} rows, {} columns",
+                    "{} fps\n{} lines\nFrametime: {}ms\n{} screen writes per frame\nterminal is {} rows, {} columns",
                     fps,
                     lines.len(),
                     frametime,
@@ -225,16 +227,16 @@ fn main() -> Result<()> {
             },
         );
         if time_since_last_disp.elapsed().as_millis() >= 150 {
-            frametime = frame_time_ns;
+            frametime = frame_time_ms;
             fps = 1_000_000_000 / frame_time_ns;
-            time_since_last_disp = Instant::now();
         }
-        if time_since_last_spawn.elapsed().as_millis() >= 10 {
+        if time_since_last_spawn.elapsed().as_millis() >= 20 - (columns as f32 * 0.04784689) as u128
+        {
             let column = rng.gen_range(0..columns);
             lines.push(Line {
                 items: (0..rows)
                     .map(|row| {
-                        rand::rngs::StdRng::seed_from_u64(row as u64 * column as u64)
+                        rand::rngs::StdRng::seed_from_u64((row + 1) as u64 * (column + 1) as u64)
                             .sample(Alphanumeric)
                     })
                     .map(char::from)
@@ -248,12 +250,13 @@ fn main() -> Result<()> {
             });
             lines = lines
                 .into_iter()
-                .filter(|line| !(line.y - line.length as f64 > rows as f64))
+                .filter(|line| !(line.y - line.length as f64 >= rows as f64))
                 .collect();
             time_since_last_spawn = Instant::now();
         }
         if time_since_last_disp.elapsed().as_millis() >= 150 {
             writes = screen.flush()?;
+            time_since_last_disp = Instant::now();
         } else {
             screen.flush()?;
         }
